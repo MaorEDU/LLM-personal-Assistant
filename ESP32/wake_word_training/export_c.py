@@ -19,6 +19,7 @@ H.write("#define WW_FRAMES %d\n#define WW_MELS %d\n#define WW_FRAME_LEN %d\n#def
     feat.N_FRAMES,feat.N_MEL,feat.FRAME_LEN,feat.FRAME_STEP,feat.NFFT,feat.N_BINS))
 H.write("#define WW_SR %d\n#define WW_CLIP %d\n"%(feat.SR,feat.CLIP))
 H.write("static const float WW_MEAN=%s;\nstatic const float WW_STD=%s;\n"%(_f(MEAN),_f(STD)))
+H.write("#define WW_CMN 1\n")   # model trained on per-band mean-normalized log-mel (see feat.py)
 # conv dims
 H.write("#define WW_C1_OUT %d\n#define WW_C2_OUT %d\n#define WW_C3_OUT %d\n"%(c1w.shape[3],c2w.shape[3],c3w.shape[3]))
 H.write("#define WW_C1_IN %d\n#define WW_C2_IN %d\n#define WW_C3_IN %d\n"%(c1w.shape[2],c2w.shape[2],c3w.shape[2]))

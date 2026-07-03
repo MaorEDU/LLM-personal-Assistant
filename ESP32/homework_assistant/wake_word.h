@@ -7,101 +7,95 @@
 // child's answer (ended automatically by trailing silence).
 //
 // HOW IT WORKS — fully on-device, NOTHING to install:
-//   • A small CNN (trained offline on synthetic "hey pip" speech) runs on a
-//     log-mel spectrogram of the last 1 second of audio. Both the front-end and
-//     the network are plain C in ww_infer.h + hey_pip_model.h — no TensorFlow,
-//     no Edge Impulse, no Arduino ML library. The exact same math was verified
-//     bit-for-bit against the trainer on a host PC.
-//   • Streaming: each poll reads ~200 ms of new mic audio into a rolling 1 s
-//     window and runs one inference; prob["hey pip"] ≥ WAKE_WORD_THRESHOLD fires.
-//   • Audio comes from the SAME I2S/ES8311 path used for recording: we reuse the
-//     sketch's i2s_start_recording()/i2s_stop_recording() and strip to the mic
-//     channel. I2S is installed only while listening and released the moment the
-//     wake word fires, so it never collides with the recorder or the TTS player.
+//   • A small CNN (retrained on the REAL /ww recordings from this device's mic,
+//     plus neural-TTS voices and hard negatives) runs on a log-mel spectrogram
+//     of the last 1 second of audio. Both the front-end and the network are
+//     plain C in ww_infer.h + hey_pip_model.h — no TensorFlow, no Edge Impulse.
+//     The exact same math is verified bit-for-bit against the trainer on a host
+//     PC (parity.py).
+//   • The features are level-invariant (per-band CMN, see ww_infer.h): the model
+//     scores the SHAPE of the sound, not its absolute loudness, so mic-level
+//     drift (covered mic hole, codec gain changes) no longer silently kills it.
+//   • Streaming: each poll reads ~100 ms of new mic audio into rolling 1 s
+//     windows and runs one inference; prob["hey pip"] ≥ WAKE_WORD_THRESHOLD on
+//     WW_CONSEC consecutive polls fires.
 //
-// TUNING: the defaults below are tuned for SENSITIVITY — the reported failure was
-// "rarely detects", made worse by the partly-covered mic hole (= a quieter mic).
-// If it now FALSE-fires, raise WAKE_WORD_THRESHOLD (toward 0.80–0.90), raise
-// WW_MIN_PEAK, or raise WW_CONSEC. If it still MISSES, build with WW_TEST_MODE 1,
-// say "hey pip", read the 'max' score column, and set WAKE_WORD_THRESHOLD a touch
-// below it. The model was trained on synthetic voices, so expect to tune this once
-// on the real device. See Documentation/WAKE_WORD.md.
+// THE TWO DEVICE-SIDE FIXES THAT MADE IT WORK (July 2026):
+//   1. CODEC LISTEN GAIN — the ES8311's ADC scale-up (REG16) idled at 24dB while
+//      the analog PGA was already maxed; a distant "hey pip" reached the CPU at
+//      peak ~0.01, i.e. ~8 bits of real signal. While listening we now raise
+//      REG16 to its 42dB max (es8311SetWakeListenBoost), +18dB of REAL resolution,
+//      and restore it before the answer is recorded so STT levels are untouched.
+//   2. NO MORE PINNED/GUESSED MIC SLOT — the ES8311 is mono inside a stereo I2S
+//      frame; the other slot carries only steady clock/common-mode crosstalk
+//      (crest ≈1, no modulation). Instead of pinning one slot (deaf forever if
+//      wrong) or energy-picking at boot (crosstalk out-energizes a quiet room),
+//      we keep BOTH slots' rolling windows and pick per poll by SPEECH-LIKENESS
+//      (variance of frame RMS — speech modulates, crosstalk doesn't), falling
+//      back to the slot the last successful STT capture proved is the mic
+//      (wakeWordNoteSttChannel). A wrong pick is only possible when the window
+//      holds no speech at all — exactly when the noise gate squelches anyway.
+//
+// TUNING: flash with WW_TEST_MODE 1, watch both slots' levels + the live score,
+// then adjust WAKE_WORD_THRESHOLD / WW_MIN_PEAK. See Documentation/WAKE_WORD.md.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include <Arduino.h>
 #include <driver/i2s.h>
 #include <string.h>
 #include "pins.h"
-#include "ww_infer.h"     // pure-C log-mel + CNN (includes hey_pip_model.h)
+#include "ww_infer.h"     // pure-C log-mel(+CMN) + CNN (includes hey_pip_model.h)
 
-// Confidence (0..1) on the "hey pip" class needed to trigger. Lowered 0.80→0.70:
-// once the input is leveled correctly (noise gate + auto-gain below), a real
-// "hey pip" scores well above this — 0.80 was rejecting borderline-but-valid
-// utterances, especially when the wake word is spoken at arm's length or farther.
+// Confidence (0..1) on the "hey pip" class needed to trigger. Set from the host
+// eval on the real /ww recordings (wake_word_training/eval_device.py, 2026-07-03):
+// at 0.90 with WW_CONSEC=3, real-"hey pip" recall was 149/149 usable files
+// (5th-percentile debounced score 0.993 — huge margin), 0 false fires over 10 min
+// of real ambient, 5/200 other-speech files. Raise toward 0.95 if it false-fires
+// on speech; lower toward 0.80 if it misses (watch 'score'/'max' in WW_TEST_MODE).
 #ifndef WAKE_WORD_THRESHOLD
-#define WAKE_WORD_THRESHOLD 0.70f
+#define WAKE_WORD_THRESHOLD 0.90f
 #endif
 
-// ── Input auto-gain ───────────────────────────────────────────────────────────
-// The model was trained on clips normalized to peak ≈0.25–1.0, but this ES8311
-// mic delivers a much quieter signal (peak ~0.01–0.03). Log-mel features are
-// level-sensitive, so without scaling the input the model sees out-of-distribution
-// audio and never fires. Before each inference we scale the 1 s window so its peak
-// reaches WW_TARGET_PEAK — matching training — capped at WW_MAX_GAIN so a silent
-// room's noise floor isn't blown up to speech level (which could false-fire).
-// This is wake-word-only; it does NOT touch the shared codec gain or the STT path.
+// ── Window leveling ───────────────────────────────────────────────────────────
+// The 1 s window is peak-normalized to WW_TARGET_PEAK before inference. With the
+// CMN front-end the model no longer NEEDS an exact level — this only keeps the
+// log-mel epsilon floor in the same regime as training (clips at peak 0.10–1.0).
 #ifndef WW_TARGET_PEAK
 #define WW_TARGET_PEAK 0.60f
 #endif
+// Gain cap so a silent room's floor is never blown up to speech level. With the
+// +18dB codec listen boost, a distant "hey pip" reaches peak ~0.08–0.4 → typical
+// gain 1.5–8×; the cap only engages on near-silence (which the gate rejects).
 #ifndef WW_MAX_GAIN
-#define WW_MAX_GAIN 50.0f          // 20→50: with the mic hole partly covered the window
-                                   // peak can sit ~0.012–0.02, which needs 30–50× to reach
-                                   // WW_TARGET_PEAK. The noise gate (WW_MIN_PEAK) still stops
-                                   // a silent room from being amplified into a false fire.
+#define WW_MAX_GAIN 25.0f
 #endif
 
 // ── False-fire suppression ────────────────────────────────────────────────────
-// NOISE GATE: ignore any window whose RAW peak is below this — pure silence must
-// never be amplified-then-scored (that produced the 0.4–0.8 "ghost" scores). But
-// the gate MUST sit below a real, possibly-distant "hey pip": with the mic hole
-// partly covered a valid utterance can peak as low as ~0.015, so the gate lives
-// just under that and we lean on the model's dedicated noise class + the WW_CONSEC
-// debounce to reject the occasional room-noise window that slips through. Raise it
-// if a quiet room false-fires; lower it if a soft wake word is ignored (watch the
-// 'win' column in test mode).
+// NOISE GATE: ignore any window whose RAW peak (on the chosen mic slot, with the
+// listen boost active) is below this. Boosted quiet-room floor measured ~0.03,
+// boosted distant speech ~0.10 — the gate sits between. Raise it if a quiet room
+// false-fires; lower it if a soft wake word is ignored (watch 'win' in test mode).
 #ifndef WW_MIN_PEAK
-#define WW_MIN_PEAK 0.008f         // 0.030→0.015→0.008 — on-device measurement showed a real,
-                                   // normal-volume "hey pip" raw-peaks at ~0.012 through this
-                                   // board's built-in mic; 0.015 was squelching it before scoring.
-                                   // 0.008 sits between the ~0.004 quiet-room floor and ~0.012 speech.
+#define WW_MIN_PEAK 0.040f
 #endif
 // DEBOUNCE: a real wake word stays in the 1 s window for several polls, so it
-// scores high on WW_CONSEC polls in a row; stray noise blips don't. Require this
-// many consecutive over-threshold polls before firing.
+// scores high on WW_CONSEC polls in a row; stray noise blips don't. 3 polls =
+// 300 ms of sustained confidence: in the host eval this halved other-speech
+// false fires vs 2, at ZERO recall cost (real positives hold ≥0.99 for many
+// polls). Only lower to 2 if very fast/clipped "hey pip" utterances get missed.
 #ifndef WW_CONSEC
-#define WW_CONSEC 2   // 3→2: 3-in-a-row over a high threshold was hard to satisfy for real
-                      // (quieter) utterances. 2 consecutive polls still rejects single-poll
-                      // score jitter. Raise back to 3 if you start getting false fires.
+#define WW_CONSEC 3
 #endif
 
 // New audio pulled in per poll (samples @16 kHz). 1600 = 100 ms → ~100 ms detect
-// granularity; the model still sees the full 1 s window each time. Smaller hop =
-// the phrase is scored at more alignments inside the window (a streaming-KWS recall
-// win) and detection reacts ~100 ms sooner, at the cost of one extra inference/100 ms.
+// granularity; the model still sees the full 1 s window each time.
 #ifndef WW_HOP
 #define WW_HOP 1600
 #endif
 
-// Stereo slot carrying the mic. The ES8311 is mono and always lands on the SAME
-// I2S slot on this board (slot 1 / RIGHT); the other slot carries constant
-// clock/common-mode crosstalk at a steady ~0.007 (crest ~1.0). Pinned, not
-// auto-detected: the old energy-based boot calibration compared the two slots
-// over a 64 ms window and, whenever the room was quiet at boot, the crosstalk
-// slot out-energized the silent mic and the device locked onto the WRONG (deaf)
-// channel for the whole session — the root cause of "hey pip" intermittently
-// never firing. (The STT recorder uses the same energy pick but runs it AFTER
-// capturing loud speech, so it stays reliable there.) Flip to 0 only if a board
-// revision wires the mic on the other slot.
+// Fallback stereo slot for the mic when neither the speech-likeness picker nor a
+// past STT capture can decide (i.e. the window is essentially silent — harmless,
+// the gate squelches those). On this board the mic was observed on slot 1.
 #ifndef WW_MIC_CHANNEL
 #define WW_MIC_CHANNEL 1
 #endif
@@ -110,12 +104,14 @@
 void i2s_start_recording();
 void i2s_stop_recording();
 void faceTick();
+// es8311SetWakeListenBoost() comes from es8311.h, included before us in the .ino.
 
 // ── State / PSRAM scratch ─────────────────────────────────────────────────────
 static bool   ww_active = false;
-static int    ww_mic_ch = 0;
+static int    ww_stt_ch = -1;      // mic slot proven by the last STT capture (-1 = none yet)
+static int    ww_last_ch = WW_MIC_CHANNEL;   // slot used for the most recent inference
 static int    ww_consec = 0;       // consecutive over-threshold polls (debounce)
-static float* ww_ring = nullptr;   // rolling 1 s window  (WW_CLIP)
+static float* ww_win[2] = {nullptr, nullptr}; // rolling 1 s window per stereo slot
 static float* ww_sig  = nullptr;   // gain-normalized copy fed to inference (WW_CLIP)
 static float* ww_feat = nullptr;   // log-mel             (WW_FRAMES*WW_MELS)
 static float* ww_b1 = nullptr;     // conv1 activations
@@ -129,86 +125,143 @@ inline bool wakeWordBegin(){
   int H1=ww_oh(WW_FRAMES), W1=ww_oh(WW_MELS);
   int H2=ww_oh(H1),        W2=ww_oh(W1);
   int H3=ww_oh(H2),        W3=ww_oh(W2);
-  ww_ring = (float*)ps_malloc(sizeof(float)*WW_CLIP);
+  ww_win[0] = (float*)ps_malloc(sizeof(float)*WW_CLIP);
+  ww_win[1] = (float*)ps_malloc(sizeof(float)*WW_CLIP);
   ww_sig  = (float*)ps_malloc(sizeof(float)*WW_CLIP);
   ww_feat = (float*)ps_malloc(sizeof(float)*WW_FRAMES*WW_MELS);
   ww_b1   = (float*)ps_malloc(sizeof(float)*H1*W1*WW_C1_OUT);
   ww_b2   = (float*)ps_malloc(sizeof(float)*H2*W2*WW_C2_OUT);
   ww_b3   = (float*)ps_malloc(sizeof(float)*H3*W3*WW_C3_OUT);
-  if(!ww_ring||!ww_sig||!ww_feat||!ww_b1||!ww_b2||!ww_b3){
+  if(!ww_win[0]||!ww_win[1]||!ww_sig||!ww_feat||!ww_b1||!ww_b2||!ww_b3){
     Serial.println("[WakeWord] ❌ PSRAM alloc failed.");
     return false;
   }
-  Serial.printf("[WakeWord] 'hey pip' model ready: %d-frame log-mel, CNN %d/%d/%d, threshold %.2f\n",
-                WW_FRAMES, WW_C1_OUT, WW_C2_OUT, WW_C3_OUT, (double)WAKE_WORD_THRESHOLD);
+  Serial.printf("[WakeWord] 'hey pip' model ready: %d-frame log-mel%s, CNN %d/%d/%d, threshold %.2f\n",
+                WW_FRAMES,
+#ifdef WW_CMN
+                "+CMN",
+#else
+                "",
+#endif
+                WW_C1_OUT, WW_C2_OUT, WW_C3_OUT, (double)WAKE_WORD_THRESHOLD);
   return true;
 }
 
-// Pin the mic to its fixed I2S slot (see WW_MIC_CHANNEL). We still read+discard
-// one DMA buffer so any codec-startup garbage doesn't enter the rolling window,
-// but we no longer let boot-time silence decide the channel (that locked onto the
-// deaf crosstalk slot — see WW_MIC_CHANNEL).
-static void ww_calibrate_channel(){
-  const int FR=1024; static int16_t tmp[FR*2]; size_t br=0;
-  i2s_read(I2S_PORT,(char*)tmp,sizeof(tmp),&br,portMAX_DELAY);
-  ww_mic_ch = WW_MIC_CHANNEL;
+// The .ino calls this after every successful answer capture with the stereo slot
+// its (loud-speech, reliable) energy pick chose — ground truth for our picker.
+inline void wakeWordNoteSttChannel(int ch){
+  if(ch==0 || ch==1) ww_stt_ch = ch;
 }
 
-// Begin listening: install I2S, find mic channel, clear the rolling window.
+// Begin listening: raise the codec listen gain, install I2S, flush the first DMA
+// buffer (codec-settling garbage), clear the rolling windows.
 inline void wakeWordStartListening(){
   if(ww_active) return;
+  es8311SetWakeListenBoost(true);          // +18dB ADC scale-up while we listen
   i2s_start_recording();
-  ww_calibrate_channel();
-  memset(ww_ring,0,sizeof(float)*WW_CLIP);
-  ww_active=true;
+  { const int FR=1024; static int16_t tmp[FR*2]; size_t br=0;
+    i2s_read(I2S_PORT,(char*)tmp,sizeof(tmp),&br,portMAX_DELAY); }
+  memset(ww_win[0],0,sizeof(float)*WW_CLIP);
+  memset(ww_win[1],0,sizeof(float)*WW_CLIP);
+  ww_consec = 0;
+  ww_active = true;
 }
 
-// Stop listening and release I2S for the recorder / TTS player.
+// Stop listening and release I2S for the recorder / TTS player. Restores the
+// codec to the exact STT levels BEFORE the recorder reinstalls I2S.
 inline void wakeWordStopListening(){
   if(!ww_active) return;
   i2s_stop_recording();
+  es8311SetWakeListenBoost(false);
   ww_active=false;
 }
 
-// Scale a 1 s window to the training peak level (WW_TARGET_PEAK), capped at
-// WW_MAX_GAIN. Writes to `out` and never touches the rolling window, so the gain
-// can't compound across polls. Returns the gain applied (handy for logging).
+// Slide both rolling windows by WW_HOP and read fresh stereo samples into their
+// tails. Returns via out-params the per-hop RMS/peak of each slot (test mode).
+static void ww_read_hop(float* rms0, float* pk0, float* rms1, float* pk1){
+  memmove(ww_win[0], ww_win[0]+WW_HOP, (WW_CLIP-WW_HOP)*sizeof(float));
+  memmove(ww_win[1], ww_win[1]+WW_HOP, (WW_CLIP-WW_HOP)*sizeof(float));
+  float* t0 = ww_win[0]+(WW_CLIP-WW_HOP);
+  float* t1 = ww_win[1]+(WW_CLIP-WW_HOP);
+  float ss0=0, ss1=0, p0=0, p1=0;
+  int got=0; int16_t st[256*2];
+  while(got<WW_HOP){
+    int want=WW_HOP-got, frames=want<256?want:256; size_t br=0;
+    i2s_read(I2S_PORT,(char*)st,frames*4,&br,portMAX_DELAY);
+    int f=(int)(br/4);
+    for(int i=0;i<f && got<WW_HOP;i++){
+      float a = st[i*2+0]/32768.0f, b = st[i*2+1]/32768.0f;
+      t0[got]=a; t1[got]=b; got++;
+      ss0+=a*a; ss1+=b*b;
+      if(fabsf(a)>p0) p0=fabsf(a);
+      if(fabsf(b)>p1) p1=fabsf(b);
+    }
+    faceTick();
+  }
+  if(rms0) *rms0 = sqrtf(ss0/(float)WW_HOP);
+  if(pk0)  *pk0  = p0;
+  if(rms1) *rms1 = sqrtf(ss1/(float)WW_HOP);
+  if(pk1)  *pk1  = p1;
+}
+
+// SPEECH-LIKENESS of a 1 s window: coefficient of variation of its 50 ms frame
+// RMS. Speech modulates strongly (CV >> 0); the crosstalk slot is a steady tone
+// (CV ≈ 0). This is what lets us find the mic without trusting wiring lore.
+static float ww_speechiness(const float* w){
+  const int NF=20, FL=WW_CLIP/NF;
+  float m=0.0f, m2=0.0f;
+  for(int f=0;f<NF;f++){
+    const float* p=w+f*FL; float acc=0.0f;
+    for(int i=0;i<FL;i++) acc+=p[i]*p[i];
+    float r=sqrtf(acc/(float)FL);
+    m+=r; m2+=r*r;
+  }
+  m/=NF; m2/=NF;
+  float var=m2-m*m; if(var<0) var=0;
+  return sqrtf(var)/(m+1e-9f);
+}
+
+// Choose the slot to score this poll. Clear dynamics winner → take it; otherwise
+// trust the slot the last STT capture proved; otherwise the wiring default.
+static int ww_pick_channel(float cv0, float cv1){
+  float hi = cv0>cv1?cv0:cv1, lo = cv0<cv1?cv0:cv1;
+  if(hi > 1.3f*lo + 0.02f) return (cv1>cv0)?1:0;
+  if(ww_stt_ch >= 0) return ww_stt_ch;
+  return WW_MIC_CHANNEL;
+}
+
+// Scale a 1 s window to WW_TARGET_PEAK, capped at WW_MAX_GAIN. Writes to `out`
+// (never touches the rolling window, so gain can't compound across polls).
 static float ww_normalize(const float* in, float* out, float* gainOut){
   float peak = 1e-6f;
   for(int i=0;i<WW_CLIP;i++){ float a = fabsf(in[i]); if(a>peak) peak=a; }
   float g = WW_TARGET_PEAK / peak;
   if(g > WW_MAX_GAIN) g = WW_MAX_GAIN;
-  if(g < 1.0f)        g = 1.0f;     // already loud enough — leave as-is, never attenuate
+  if(g < 1.0f)        g = 1.0f;     // already loud enough — never attenuate
   for(int i=0;i<WW_CLIP;i++) out[i] = in[i]*g;
   if(gainOut) *gainOut = g;
-  return peak;                      // RAW window peak (pre-gain) — input to the noise gate
+  return peak;                      // RAW window peak (pre-gain) — noise-gate input
 }
 
-// Pull ~WW_HOP ms of new audio, slide the window, run one inference.
+// Pull ~100 ms of new audio, slide the windows, run one inference on the mic slot.
 // Returns 1 if "hey pip" detected this poll, 0 if not, -1 if not listening.
 inline int wakeWordPoll(){
   if(!ww_active) return -1;
+  ww_read_hop(nullptr,nullptr,nullptr,nullptr);
 
-  // Slide the rolling window left by WW_HOP and read fresh mono mic samples in.
-  memmove(ww_ring, ww_ring+WW_HOP, (WW_CLIP-WW_HOP)*sizeof(float));
-  float* tail = ww_ring+(WW_CLIP-WW_HOP);
-  int got=0; int16_t st[256*2];
-  while(got<WW_HOP){
-    int want=WW_HOP-got, frames=want<256?want:256; size_t br=0;
-    i2s_read(I2S_PORT,(char*)st,frames*4,&br,portMAX_DELAY);
-    int f=br/4;
-    for(int i=0;i<f && got<WW_HOP;i++) tail[got++]=st[i*2+ww_mic_ch]/32768.0f;
-    faceTick();
-  }
+  float cv0 = ww_speechiness(ww_win[0]);
+  float cv1 = ww_speechiness(ww_win[1]);
+  int   ch  = ww_pick_channel(cv0, cv1);
+  ww_last_ch = ch;
 
-  float winpeak = ww_normalize(ww_ring, ww_sig, nullptr);   // normalize + get raw level
-  if(winpeak < WW_MIN_PEAK){ ww_consec = 0; return 0; }     // squelch: room too quiet to be speech
+  float winpeak = ww_normalize(ww_win[ch], ww_sig, nullptr);
+  if(winpeak < WW_MIN_PEAK){ ww_consec = 0; return 0; }     // room too quiet to be speech
   float prob[WW_NCLASS];
   ww_infer(ww_sig, ww_feat, ww_b1, ww_b2, ww_b3, prob);     // prob[1] = "hey pip"
   if(prob[1] >= WAKE_WORD_THRESHOLD){
-    if(++ww_consec >= WW_CONSEC){                            // sustained over several polls → real
+    if(++ww_consec >= WW_CONSEC){                            // sustained → real
       ww_consec = 0;
-      Serial.printf("[WakeWord] 'hey pip' %.2f  ✓\n", (double)prob[1]);
+      Serial.printf("[WakeWord] 'hey pip' %.2f (ch%d) ✓\n", (double)prob[1], ch);
       return 1;
     }
   } else {
@@ -218,28 +271,27 @@ inline int wakeWordPoll(){
 }
 
 // ── On-device TEST MODE — live score printer for tuning / debugging ───────────
-// Never returns. Streams one line per ~WW_HOP of audio with everything you need
-// to diagnose an unresponsive wake word WITHOUT any cloud setup:
-//   ch    = which stereo slot the mic was found on (0 or 1)
-//   rms   = average level of this slice (0..1). Should jump up when you talk.
-//   peak  = loudest sample this slice (0..1). ~0 while speaking ⇒ no mic audio.
-//   score = model confidence for "hey pip" (0..1). Compare against the threshold.
-//   max   = highest score seen so far this run (the peak of your "hey pip").
-// Tuning recipe: say "hey pip" a few times, note the 'max', then set
-// WAKE_WORD_THRESHOLD a touch below it (e.g. max 0.74 → threshold 0.65).
-// Requires wakeWordBegin() to have run first (scratch buffers + codec up).
+// Never returns. One line per ~100 ms of audio with everything needed to diagnose
+// an unresponsive wake word WITHOUT any cloud setup:
+//   p0/p1   = per-hop peak of stereo slot 0 / slot 1 (0..1). The one that jumps
+//             when you talk is the mic; the one stuck at a constant small value
+//             is the crosstalk slot. BOTH ~0 while speaking ⇒ no audio at all.
+//   cv0/cv1 = speech-likeness of each slot's 1 s window (modulation). The picker
+//             takes the clearly higher one.
+//   ch      = slot actually scored this poll.
+//   win     = chosen window's RAW peak (pre-gain) — compare against WW_MIN_PEAK.
+//   gain    = auto-level applied before inference (caps at WW_MAX_GAIN).
+//   score   = model confidence for "hey pip"; max = highest so far this run.
+// Tuning recipe: say "hey pip" a few times, note 'max', set WAKE_WORD_THRESHOLD
+// a touch below it. If 'win' shows [gated] while you speak, lower WW_MIN_PEAK.
 inline void wakeWordRunTestMode(){
   Serial.println("\n========== WAKE-WORD TEST MODE ==========");
-  Serial.printf ("Threshold = %.2f. Say \"hey pip\" and watch 'score'/'max'.\n",
-                 (double)WAKE_WORD_THRESHOLD);
-  Serial.println("  win  = window peak BEFORE gain; quiet room ~0.015, real 'hey pip' ~0.07+");
-  Serial.println("  gain = auto-boost to the model's training level (caps at WW_MAX_GAIN)");
-  Serial.println("  [gated] = below WW_MIN_PEAK, ignored;  (arming)=1 hit;  FIRE=WW_CONSEC in a row");
-  Serial.println("  too many false fires  -> raise WW_MIN_PEAK / WAKE_WORD_THRESHOLD / WW_CONSEC");
-  Serial.println("  misses your wake word -> lower WAKE_WORD_THRESHOLD (watch 'max') or WW_MIN_PEAK");
-  Serial.println("This loop never exits; reflash with WW_TEST_MODE 0 for normal use.\n");
+  Serial.printf ("Threshold=%.2f  gate=%.3f  consec=%d  (codec listen boost ACTIVE: +18dB)\n",
+                 (double)WAKE_WORD_THRESHOLD, (double)WW_MIN_PEAK, WW_CONSEC);
+  Serial.println("Say \"hey pip\" and watch 'score'/'max'. This loop never exits;");
+  Serial.println("reflash with WW_TEST_MODE 0 for normal use.\n");
 
-  if(!ww_ring){
+  if(!ww_win[0]){
     Serial.println("[WWTEST] scratch not allocated — wakeWordBegin() failed (PSRAM?). Halting.");
     while(true){ faceTick(); delay(200); }
   }
@@ -248,23 +300,12 @@ inline void wakeWordRunTestMode(){
   float maxScore = 0.0f;
   int   tmConsec = 0;
   while(true){
-    // Same window slide + mic read as wakeWordPoll(), but we also measure the
-    // level and ALWAYS print (never gated on the threshold).
-    memmove(ww_ring, ww_ring+WW_HOP, (WW_CLIP-WW_HOP)*sizeof(float));
-    float* tail = ww_ring+(WW_CLIP-WW_HOP);
-    int got=0; int16_t st[256*2]; float sumSq=0.0f, peak=0.0f;
-    while(got<WW_HOP){
-      int want=WW_HOP-got, frames=want<256?want:256; size_t br=0;
-      i2s_read(I2S_PORT,(char*)st,frames*4,&br,portMAX_DELAY);
-      int f=br/4;
-      for(int i=0;i<f && got<WW_HOP;i++){
-        float s = st[i*2+ww_mic_ch]/32768.0f;
-        tail[got++]=s; sumSq+=s*s; if(fabsf(s)>peak) peak=fabsf(s);
-      }
-      faceTick();
-    }
-    float rms = sqrtf(sumSq/(float)WW_HOP);
-    float gain; float winpeak = ww_normalize(ww_ring, ww_sig, &gain);   // same as live detection
+    float r0,p0,r1,p1;
+    ww_read_hop(&r0,&p0,&r1,&p1);
+    float cv0 = ww_speechiness(ww_win[0]);
+    float cv1 = ww_speechiness(ww_win[1]);
+    int   ch  = ww_pick_channel(cv0, cv1);
+    float gain; float winpeak = ww_normalize(ww_win[ch], ww_sig, &gain);
     float prob[WW_NCLASS];
     ww_infer(ww_sig, ww_feat, ww_b1, ww_b2, ww_b3, prob);
     float score = prob[1];
@@ -276,8 +317,8 @@ inline void wakeWordRunTestMode(){
       if(++tmConsec >= WW_CONSEC) tag = "  <<< FIRE";
       else                        tag = "  (arming)";
     } else { tmConsec = 0; }
-    Serial.printf("[WWTEST] ch=%d  rms=%.4f  win=%.3f  gain=%4.1fx  score=%.3f  max=%.3f%s\n",
-                  ww_mic_ch, (double)rms, (double)winpeak, (double)gain,
-                  (double)score, (double)maxScore, tag);
+    Serial.printf("[WWTEST] p0=%.3f p1=%.3f cv0=%.2f cv1=%.2f ch=%d win=%.3f gain=%4.1fx score=%.3f max=%.3f%s\n",
+                  (double)p0,(double)p1,(double)cv0,(double)cv1,ch,
+                  (double)winpeak,(double)gain,(double)score,(double)maxScore,tag);
   }
 }

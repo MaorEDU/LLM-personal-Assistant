@@ -73,7 +73,9 @@ def augment_speech(u, noise_pool, pitch_shifter=None):
     if np.random.rand() < 0.30:
         s = fftconvolve(s, _rir())[:len(s) + 200].astype(np.float32)
     s = _bandlimit(s)
-    s = s / (np.max(np.abs(s)) + 1e-9) * np.random.uniform(0.25, 1.0)   # level — matches device (§1.5)
+    s = s / (np.max(np.abs(s)) + 1e-9) * np.random.uniform(0.10, 1.0)   # wide level range — CMN in
+    # feat.logmel makes the model level-invariant, so this now only varies the
+    # epsilon-floor/SNR regime rather than needing to bracket a device target level.
     buf = place_in_clip(s)
     if noise_pool is not None and len(noise_pool):
         n = _fit(noise_pool[np.random.randint(len(noise_pool))]).astype(np.float32)

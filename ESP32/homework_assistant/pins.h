@@ -48,5 +48,9 @@
 #define MAX_RECORD_MS   7000    // max recording length in ms
 #define RECORD_BUF_SIZE ((SAMPLE_RATE * SAMPLE_BITS/8 * 2 * MAX_RECORD_MS) / 1000)
 // = 16000 * 2 * 2 (stereo) * 7 = 448000 bytes — fits in ESP32-S3's 8 MB PSRAM
-// Stereo is required to match ES8311's 32-bit I2S frame (left=mic, right=zeros).
-// Left channel is extracted after recording, halving the effective byte count.
+// Stereo is required to match ES8311's 32-bit I2S frame. The codec is MONO: one
+// stereo slot carries the mic, the other only steady clock/common-mode crosstalk.
+// WHICH slot is the mic is NOT assumed anywhere: the recorder energy-picks the
+// louder slot per capture, and the wake word picks per poll by speech-likeness
+// (see wake_word.h) seeded by the recorder's choice. Mono extraction after
+// recording halves the effective byte count.

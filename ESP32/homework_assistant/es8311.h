@@ -66,6 +66,14 @@ bool initES8311() {
                                 // passes the actual voice. The earlier "differential clips"
                                 // result was caused by reg17=0xC8 (+36dB), NOT by MIC1N; with
                                 // the low digital gain below it no longer over-drives.
+  // ADC gain scale-up (REG16 ADC_SCALE[2:0], datasheet p.20-21): 0..7 -> 0..42dB in
+  // 6dB steps, applied INSIDE the codec before the signal is truncated to 16-bit
+  // I2S — so unlike software gain it recovers real resolution from the quiet mic.
+  // 0x04 (24dB) is the chip's reset default; written explicitly so the level the
+  // working STT path was tuned against no longer depends on an implicit default.
+  // The wake-word listener temporarily raises this via es8311SetWakeListenBoost().
+  es8311_write(0x16, 0x04);   // ADC_SCALE = 24dB (chip default, STT-proven level)
+
   // ADC DIGITAL volume. With the HPF now removing DC, this gain is clean. At 0xC8 the
   // mic worked but Hebrew speech was quiet (RMS ~928, -31dBFS) and STT returned empty.
   // 0xDA is ~+9dB: targets speech RMS ~2600 / peak ~24500 (-22dBFS) with headroom.
@@ -93,4 +101,18 @@ bool initES8311() {
 
   Serial.println("[ES8311] Init OK");
   return true;
+}
+
+// ── Wake-word listen gain staging ────────────────────────────────────────────
+// While the wake-word listener is armed, raise the codec's internal ADC scale-up
+// from the STT-proven 24dB to the maximum 42dB (+18dB). The analog PGA (REG14)
+// is already at its 30dB max, so this is the only real gain headroom left — and
+// because it scales BEFORE the 16-bit I2S truncation it recovers ~3 bits of true
+// resolution from a distant/quiet "hey pip" (raw peak ~0.01 -> ~0.1), instead of
+// amplifying quantization noise in software afterwards.
+// It is switched OFF again the moment listening stops, so the answer recording /
+// STT path always runs at exactly the levels it was tuned for (close speech peaks
+// ~0.75 FS at 24dB — +18dB there would clip).
+void es8311SetWakeListenBoost(bool on) {
+  es8311_write(0x16, on ? 0x07 : 0x04);   // ADC_SCALE: 7=42dB (listen) / 4=24dB (STT)
 }

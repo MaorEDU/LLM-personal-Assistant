@@ -68,6 +68,19 @@ static void ww_conv(const float* in,int IH,int IW,int IC,
 // Full forward: raw sig (WW_CLIP float) -> prob[WW_NCLASS]. Needs scratch bufs.
 static void ww_infer(const float* sig,float* feat,float* b1,float* b2,float* b3,float* prob){
   ww_logmel(sig,feat);
+#ifdef WW_CMN
+  // Per-band cepstral mean normalization — matches feat.py logmel(). Input gain
+  // adds a constant to every log-mel cell and a stationary spectral tilt adds a
+  // per-band constant; subtracting each band's mean over the frames removes both,
+  // making the score independent of absolute mic level. Defined by the model
+  // header when (and only when) the model was trained on CMN features.
+  for(int m=0;m<WW_MELS;m++){
+    float mu=0.0f;
+    for(int f=0;f<WW_FRAMES;f++) mu+=feat[f*WW_MELS+m];
+    mu/=(float)WW_FRAMES;
+    for(int f=0;f<WW_FRAMES;f++) feat[f*WW_MELS+m]-=mu;
+  }
+#endif
   for(int i=0;i<WW_FRAMES*WW_MELS;i++) feat[i]=(feat[i]-WW_MEAN)/WW_STD;
   ww_conv(feat,WW_FRAMES,WW_MELS,1,        WW_C1W,WW_C1B,b1,WW_C1_OUT);
   int H1=(WW_FRAMES-WW_K)/2+1, W1=(WW_MELS-WW_K)/2+1;

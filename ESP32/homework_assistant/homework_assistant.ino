@@ -262,6 +262,9 @@ bool processRecordedAudio() {
     float rms1 = sqrt((float)(sumSq1 / (int64_t)frames));
     micChannel = (rms1 > rms0) ? 1 : 0;
     Serial.printf("[Audio] ch0 RMS: %.0f  ch1 RMS: %.0f  -> ch%d\n", rms0, rms1, micChannel);
+#if USE_WAKE_WORD
+    wakeWordNoteSttChannel(micChannel);   // loud-speech pick = ground truth for the WW slot picker
+#endif
   }
   // Strip to mono.
   {
@@ -731,6 +734,9 @@ void processCapturedAnswer() {
     float rms1 = sqrt((float)(sumSq1 / (int64_t)frames));
     micChannel = (rms1 > rms0) ? 1 : 0;
     Serial.printf("[Main] ch0 RMS: %.0f  ch1 RMS: %.0f  -> ch%d\n", rms0, rms1, micChannel);
+#if USE_WAKE_WORD
+    wakeWordNoteSttChannel(micChannel);   // loud-speech pick = ground truth for the WW slot picker
+#endif
   }
   // Strip to mono (keep the mic channel).
   {

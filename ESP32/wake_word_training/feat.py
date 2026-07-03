@@ -30,4 +30,12 @@ def logmel(sig):
     fr=fr*HANN
     spec=np.abs(np.fft.rfft(fr,NFFT,axis=1))**2
     mel=spec@MEL_FB.T
-    return np.log(mel+1e-6).astype(np.float32)
+    lm=np.log(mel+1e-6).astype(np.float32)
+    # Per-band cepstral mean normalization (CMN): input gain g adds a constant
+    # 2*log(g) to every log-mel cell, and a stationary channel tilt (partly covered
+    # mic, codec gain changes) adds a per-band constant — subtracting each band's
+    # mean over the 98 frames removes both. This makes the model level-invariant,
+    # so the device no longer has to hit an exact absolute input level.
+    # MUST match ww_infer.h (WW_CMN) exactly — parity.py gates this.
+    lm-=lm.mean(axis=0,keepdims=True)
+    return lm

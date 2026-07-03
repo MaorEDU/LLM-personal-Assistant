@@ -347,3 +347,55 @@ Then tell the user (they flash on Windows):
   `../homework_assistant/wake_word.h` (runtime peak-norm to ~0.60 + thresholds),
   `../homework_assistant/ww_capture.h` (how the user recorded `ww/`).
 - Class order (fixed): **0=noise, 1=hey-pip, 2=other-speech.** Firmware reads `prob[1]`.
+
+---
+
+## Addendum (2026-07-03): level-invariant front-end (CMN) + device fixes
+
+### Training pipeline changes
+
+- **`feat.py` logmel now applies per-band cepstral mean normalization (CMN).**
+  After computing the 98×40 log-mel, each of the 40 mel bands has its mean over
+  the 98 frames subtracted, removing any stationary level offset or spectral tilt
+  before the CNN sees the data. `ww_infer.h` mirrors this step exactly, gated by
+  `#define WW_CMN 1`; the define is emitted by `export_c.py` into the generated
+  `hey_pip_model.h`. **The parity gate (`parity.py`) verifies the C and Keras
+  front-ends agree through CMN** — it must PASS before shipping. The `/tmp/ww`
+  workspace and parity build line are unchanged:
+  ```bash
+  cc -O2 -o out/host_test host_test.c -I/tmp/ww/out -lm
+  ```
+
+- **`augment.py` level range widened to 0.10–1.0** (was 0.25–1.0). CMN removes the
+  absolute level anyway, so training with a wider range improves robustness rather
+  than confusing the model.
+
+- **`eval_device.py` (new) replaces ad-hoc threshold evaluation.** Run it after
+  `train.py` (before `export_c.py` is strictly necessary, but after the model is
+  trained). It simulates the exact firmware streaming pipeline — rolling 1 s window,
+  100 ms hop, peak-norm, noise gate (`WW_MIN_PEAK`), 2-consecutive-poll debounce —
+  over the real `ww/` recordings, and prints recall / false-fire tables per threshold.
+  Pick `WAKE_WORD_THRESHOLD` from its output and record it in `wake_word.h`.
+
+### Device-side changes (already in firmware — no model retraining needed for these)
+
+- **ES8311 REG16 listen boost (+18 dB).** While wake-listening, the firmware raises
+  `ADC_SCALE[2:0]` in REG16 from 24 dB to 42 dB (`es8311SetWakeListenBoost()` in
+  `es8311.h`). This happens inside the codec before 16-bit I2S truncation, recovering
+  ~3 bits of resolution from quiet/distant speech. It is restored to 24 dB the moment
+  listening stops, so answer-recording and STT capture levels are completely unaffected.
+
+- **Per-poll dual-slot speech-likeness mic picking.** Instead of pinning a fixed I2S
+  slot, `wake_word.h` keeps both stereo slots' rolling 1 s windows. Each poll selects
+  the slot whose coefficient of variation of 50 ms frame RMS is higher (speech
+  modulates; the crosstalk slot is near-stationary), with fallback to the slot
+  confirmed by the last STT capture (`wakeWordNoteSttChannel`), then to
+  `WW_MIC_CHANNEL`. A wrong pick can only occur on windows with no speech, which the
+  noise gate suppresses anyway.
+
+### Net effect on retrained models
+
+Because CMN removes absolute level and the codec boost makes quiet speech visible,
+**retrained models no longer require device-side level re-tuning** after deployment.
+The workflow after retraining is: run `eval_device.py`, copy the recommended threshold
+into `WAKE_WORD_THRESHOLD` in `wake_word.h`, reflash, and verify with `WW_TEST_MODE 1`.
