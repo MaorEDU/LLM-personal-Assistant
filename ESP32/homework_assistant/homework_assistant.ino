@@ -149,7 +149,10 @@ void i2s_start_recording() {
     .channel_format   = I2S_CHANNEL_FMT_RIGHT_LEFT,  // stereo — matches ES8311's 32-bit frame
     .communication_format = I2S_COMM_FORMAT_STAND_I2S,
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count    = 8,
+    .dma_buf_count    = 12,   // 12×512 frames = 384 ms of RX buffering: rides out
+                              // heartbeat HTTPS stalls / display work without the
+                              // wake-word listener losing audio (drops = the model
+                              // hears time-compressed speech and misses).
     .dma_buf_len      = 512,
     .use_apll         = true,
     .tx_desc_auto_clear = true,

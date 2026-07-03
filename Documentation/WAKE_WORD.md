@@ -35,7 +35,9 @@ back by flipping one flag (see [Reverting](#reverting-to-the-button)).
    slot whose 50 ms frame-RMS **coefficient of variation** is higher (speech
    modulates; the other slot carries only steady crosstalk), falling back to the
    slot confirmed by the last successful STT capture, then to `WW_MIC_CHANNEL`.
-3. The chosen window is peak-normalised toward `WW_TARGET_PEAK`, then a
+3. Only the log-mel frames the new hop added are computed (incremental
+   front-end — a full 98-frame recompute overran the 200 ms budget on the
+   ESP32-S3, overflowed the I2S DMA and silently dropped audio), then a
    **log-mel spectrogram** (98 × 40) is computed. **Per-band cepstral mean
    normalization (CMN)** subtracts each mel band's mean over the 98 frames, removing
    any overall level offset and stationary spectral tilt (covered mic, codec gain
@@ -71,34 +73,36 @@ tuned is identical for listening and recording.
 
 | Macro | Default | Effect |
 |-------|---------|--------|
-| `WAKE_WORD_THRESHOLD` | `0.90` (from `eval_device.py`, 2026-07-03: recall 149/149 usable positives, 0 ambient false fires in 10 min, 5/200 other-speech files) | Confidence to fire. Raise toward 0.95 to cut false fires; lower toward 0.80 to catch more. |
-| `WW_TARGET_PEAK` | `0.60` | Target peak for window normalisation before the CNN. |
-| `WW_MAX_GAIN` | `25` | Cap on the normalisation gain multiplier. |
+| `WAKE_WORD_THRESHOLD` | `0.90` (from `eval_device.py`, 2026-07-03, at hop 200 ms/consec 2: recall 149/149 real positives with min debounced score 0.971, 0 ambient false fires in 10 min, 6/200 other-speech files) | Confidence to fire. Raise toward 0.95 to cut false fires; lower toward 0.80 to catch more. |
 | `WW_MIN_PEAK` | `0.040` | Raw peak floor on the boosted signal; windows below this are noise-gated. Boosted quiet-room floor ≈ 0.03; boosted distant speech ≈ 0.10. Lower if `[gated]` appears while speaking. |
-| `WW_CONSEC` | `3` | Consecutive polls above threshold to fire (300 ms debounce). Halved other-speech false fires vs 2 at zero recall cost. |
-| `WW_HOP` | `1600` (100 ms) | Audio samples pulled per poll = detection granularity vs. CPU. |
+| `WW_CONSEC` | `2` | Consecutive polls above threshold to fire (400 ms of sustained confidence at the 200 ms hop). |
+| `WW_HOP` | `3200` (200 ms) | Audio pulled per poll = the REAL-TIME BUDGET for one inference. 1600 overran on this CNN and dropped audio — watch `dt` in test mode before lowering. |
 
 ### Reading `WW_TEST_MODE 1` output
 
 Build with `#define WW_TEST_MODE 1` in `homework_assistant.ino` to get one line per
-~100 ms on the serial port:
+~200 ms on the serial port:
 
 ```
-p0=0.012 p1=0.103  cv0=0.41 cv1=1.83  ch=1  win=0.103>0.040  gain=5.8  score=0.87  max=0.91  FIRE
+[WWTEST] dt=201 p0=0.012 p1=0.103 cv0=0.41 cv1=1.83 ch=1 win=0.103 score=0.874 max=0.912  <<< FIRE
 ```
 
+- **dt** — milliseconds this poll took. **The most important column**: it must
+  hover at ~200 (the hop). Consistently higher ⇒ the loop can't keep up, the I2S
+  DMA overflows and audio is silently DROPPED — the model then hears
+  time-compressed speech and scores ~0.1 on a perfect "hey pip". Raise `WW_HOP`.
 - **p0 / p1** — per-hop peak of each stereo slot. The slot whose `p` jumps when you
-  talk is the mic.
+  talk is the mic (identical values = the codec mirrors its mono ADC to both).
 - **cv0 / cv1** — speech-likeness of each slot (coefficient of variation of 50 ms
   frame RMS). The mic slot will have a higher CV while you speak.
 - **ch** — which slot was scored this poll.
 - **win** — chosen window raw peak vs `WW_MIN_PEAK`. If this shows `[gated]` while
   you are speaking, lower `WW_MIN_PEAK`.
-- **gain** — normalisation multiplier applied to the window.
-- **score** — `P(hey pip)` from the CNN for this poll.
+- **score** — `P(hey pip)` from the CNN for this poll (level-independent — there
+  is no gain stage anymore).
 - **max** — highest score seen since the last reset.
 - Tags: `[gated]` = noise-gated; `(arming)` = one poll above threshold;
-  `FIRE` = fired.
+  `<<< FIRE` = fired.
 
 After a few "hey pip" utterances, note `max` and set `WAKE_WORD_THRESHOLD` just
 below it.
@@ -126,9 +130,12 @@ below it.
 ## Footprint
 
 - Flash: ~83 KB of weights (mostly the mel filterbank).
-- PSRAM scratch: ~230 KB total (two 1 s slot windows + activations), allocated once
+- PSRAM scratch: ~330 KB total (two 1 s slot windows, two feature buffers,
+  conv activations), allocated once
   at boot (~+64 KB vs. a single-slot design for the second window).
-- Compute: ~30–40 ms per inference, run every ~100 ms while idle (a few % CPU).
+- Compute: ~70–100 ms per poll (incremental log-mel + one CNN pass), every
+  200 ms while idle. `dt` in test mode must hover at ~200 ms — higher means
+  the loop is overrunning and audio is being dropped.
 
 ---
 
@@ -150,7 +157,8 @@ python3 parity.py          # C-vs-Keras gate — MUST print PARITY: PASS (<1e-3)
 python3 eval_device.py     # simulates firmware streaming → prints recall/false-fire tables per threshold
 ```
 
-`eval_device.py` simulates the exact firmware pipeline (rolling window, 100 ms hop,
+`eval_device.py` simulates the exact firmware pipeline (rolling window, 200 ms hop,
+codec boost + clipping, no gain stage,
 peak-norm, noise gate, 2-consecutive debounce) over the real `ww/` recordings and
 prints per-threshold recall / false-fire tables. **Pick `WAKE_WORD_THRESHOLD` from
 its output**, not from training metrics.

@@ -1,11 +1,12 @@
 # eval_device.py — device-level evaluation of the trained model on the REAL /ww
 # recordings, simulating the firmware's streaming pipeline exactly:
-#   rolling 1 s window, WW_HOP=100 ms, peak-normalize to WW_TARGET_PEAK (gain
-#   capped at WW_MAX_GAIN, never attenuate), noise gate WW_MIN_PEAK on the raw
-#   (codec-boosted) peak, fire = WW_CONSEC consecutive over-threshold windows.
-# The recordings were captured WITHOUT the +18 dB codec listen boost, so the gate
-# is evaluated on clip*BOOST; with the CMN front-end the SCORE itself is
-# level-invariant, so this only affects gating, not model output.
+#   rolling 1 s window, WW_HOP hop, NO gain stage (the CMN front-end is level-
+#   invariant), noise gate WW_MIN_PEAK on the raw codec-boosted peak,
+#   fire = WW_CONSEC consecutive over-threshold windows.
+# The recordings were captured WITHOUT the +18 dB codec listen boost, so the
+# whole signal is scaled by BOOST and hard-clipped to ±1 first — exactly what
+# the codec hands the firmware (loud captures DO clip at 42 dB; the eval must
+# see that too).
 #
 # Run from wake_word_training/ after train.py:  python eval_device.py
 import glob
@@ -19,12 +20,10 @@ import tensorflow as tf
 import feat
 
 WW_DIR = os.environ.get("WW_DIR", "/home/user/Desktop/iot/ww")
-HOP = 1600                 # WW_HOP
-TARGET_PEAK = 0.60         # WW_TARGET_PEAK
-MAX_GAIN = 25.0            # WW_MAX_GAIN
+HOP = int(os.environ.get("WW_EVAL_HOP", "3200"))      # WW_HOP (200 ms default)
 MIN_PEAK = 0.040           # WW_MIN_PEAK (on boosted signal)
 CONSEC = int(os.environ.get("WW_EVAL_CONSEC", "2"))   # WW_CONSEC
-BOOST = 10 ** (18 / 20)    # codec listen boost the device now applies (~7.94x)
+BOOST = 10 ** (18 / 20)    # codec listen boost the device applies (~7.94x)
 THRESHOLDS = (0.50, 0.60, 0.70, 0.80, 0.85, 0.90, 0.95)
 
 m = tf.keras.models.load_model("/tmp/ww/model.keras")
@@ -33,9 +32,11 @@ MEAN, STD = float(nz["mean"]), float(nz["std"])
 
 
 def device_windows(a):
-    """Streaming 1 s windows (hop 100 ms) exactly as the firmware sees them,
-    including the fill-in phase where the phrase enters the rolling window."""
-    a = np.concatenate([np.zeros(feat.CLIP - HOP, np.float32), a.astype(np.float32)])
+    """Streaming 1 s windows exactly as the firmware sees them, including the
+    fill-in phase where the phrase enters the rolling window. The codec boost +
+    16-bit clipping is applied first, like the ADC does."""
+    a = np.clip(a.astype(np.float32) * BOOST, -1.0, 1.0)
+    a = np.concatenate([np.zeros(feat.CLIP - HOP, np.float32), a])
     if len(a) < feat.CLIP:
         a = np.pad(a, (0, feat.CLIP - len(a)))
     n = (len(a) - feat.CLIP) // HOP + 1
@@ -43,14 +44,13 @@ def device_windows(a):
 
 
 def score_windows(wins):
-    """ww_normalize + logmel(+CMN in feat) + model. Returns (probs1, gated_mask)."""
+    """logmel(+CMN in feat) + model — no gain stage, matching the firmware.
+    Returns (probs1, gated_mask)."""
     peaks = np.abs(wins).max(axis=1)
-    gains = np.clip(TARGET_PEAK / (peaks + 1e-9), 1.0, MAX_GAIN)
-    normed = wins * gains[:, None]
-    X = np.stack([feat.logmel(w) for w in normed])
+    X = np.stack([feat.logmel(w) for w in wins])
     X = ((X - MEAN) / STD)[..., None]
     p1 = m.predict(X, verbose=0, batch_size=256)[:, 1]
-    gated = (peaks * BOOST) < MIN_PEAK        # True = firmware squelches this window
+    gated = peaks < MIN_PEAK                  # True = firmware squelches this window
     return p1, gated
 
 

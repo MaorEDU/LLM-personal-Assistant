@@ -32,21 +32,26 @@ static void ww_fft(float* re, float* im){
   }
 }
 
+// One log-mel row: frame f of a WW_CLIP window -> out[WW_MELS]. Exposed so the
+// streaming detector can compute ONLY the frames a new hop added (the full
+// 98-frame recompute every poll was what overran the I2S DMA on-device).
+static void ww_logmel_frame(const float* sig, int f, float* out){
+  static float re[WW_NFFT], im[WW_NFFT];
+  int s=f*WW_FRAME_STEP;
+  for(int n=0;n<WW_FRAME_LEN;n++){ re[n]=sig[s+n]*WW_HANN[n]; im[n]=0.0f; }
+  for(int n=WW_FRAME_LEN;n<WW_NFFT;n++){ re[n]=0.0f; im[n]=0.0f; }
+  ww_fft(re,im);
+  for(int m=0;m<WW_MELS;m++){
+    const float* fb=&WW_MELFB[m*WW_BINS];
+    float acc=0.0f;
+    for(int b=0;b<WW_BINS;b++){ float p=re[b]*re[b]+im[b]*im[b]; acc+=fb[b]*p; }
+    out[m]=logf(acc+1e-6f);
+  }
+}
+
 // log-mel of WW_CLIP samples -> feat[WW_FRAMES*WW_MELS]
 static void ww_logmel(const float* sig, float* feat){
-  static float re[WW_NFFT], im[WW_NFFT];
-  for(int f=0; f<WW_FRAMES; f++){
-    int s=f*WW_FRAME_STEP;
-    for(int n=0;n<WW_FRAME_LEN;n++){ re[n]=sig[s+n]*WW_HANN[n]; im[n]=0.0f; }
-    for(int n=WW_FRAME_LEN;n<WW_NFFT;n++){ re[n]=0.0f; im[n]=0.0f; }
-    ww_fft(re,im);
-    for(int m=0;m<WW_MELS;m++){
-      const float* fb=&WW_MELFB[m*WW_BINS];
-      float acc=0.0f;
-      for(int b=0;b<WW_BINS;b++){ float p=re[b]*re[b]+im[b]*im[b]; acc+=fb[b]*p; }
-      feat[f*WW_MELS+m]=logf(acc+1e-6f);
-    }
-  }
+  for(int f=0; f<WW_FRAMES; f++) ww_logmel_frame(sig, f, &feat[f*WW_MELS]);
 }
 
 // conv2d 'valid' stride2 + ReLU. in[IH*IW*IC] kernel Keras layout (kh,kw,ic,oc).
@@ -65,9 +70,10 @@ static void ww_conv(const float* in,int IH,int IW,int IC,
   }
 }
 
-// Full forward: raw sig (WW_CLIP float) -> prob[WW_NCLASS]. Needs scratch bufs.
-static void ww_infer(const float* sig,float* feat,float* b1,float* b2,float* b3,float* prob){
-  ww_logmel(sig,feat);
+// Forward pass from PRECOMPUTED log-mel features. `feat` is modified in place
+// (CMN + standardization), so streaming callers must pass a scratch COPY of
+// their rolling feature buffer. prob[WW_NCLASS] out.
+static void ww_infer_from_feat(float* feat,float* b1,float* b2,float* b3,float* prob){
 #ifdef WW_CMN
   // Per-band cepstral mean normalization — matches feat.py logmel(). Input gain
   // adds a constant to every log-mel cell and a stationary spectral tilt adds a
@@ -94,4 +100,11 @@ static void ww_infer(const float* sig,float* feat,float* b1,float* b2,float* b3,
   for(int c=0;c<WW_NCLASS;c++){ float a=WW_DB[c]; for(int k=0;k<WW_GAP;k++) a+=gap[k]*WW_DW[k*WW_NCLASS+c]; logit[c]=a; if(a>mx)mx=a; }
   float sum=0; for(int c=0;c<WW_NCLASS;c++){ logit[c]=expf(logit[c]-mx); sum+=logit[c]; }
   for(int c=0;c<WW_NCLASS;c++) prob[c]=logit[c]/sum;
+}
+
+// Full forward: raw sig (WW_CLIP float) -> prob[WW_NCLASS]. Needs scratch bufs.
+// (Host parity / one-shot path; the device streams via ww_infer_from_feat.)
+static void ww_infer(const float* sig,float* feat,float* b1,float* b2,float* b3,float* prob){
+  ww_logmel(sig,feat);
+  ww_infer_from_feat(feat,b1,b2,b3,prob);
 }

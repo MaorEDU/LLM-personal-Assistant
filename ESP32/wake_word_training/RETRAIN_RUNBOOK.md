@@ -399,3 +399,25 @@ Because CMN removes absolute level and the codec boost makes quiet speech visibl
 **retrained models no longer require device-side level re-tuning** after deployment.
 The workflow after retraining is: run `eval_device.py`, copy the recommended threshold
 into `WAKE_WORD_THRESHOLD` in `wake_word.h`, reflash, and verify with `WW_TEST_MODE 1`.
+
+### Update (2026-07-03, after first on-device test): hard-real-time front-end
+
+On-device WW_TEST_MODE showed a real "hey pip" spanning only ~2 hops — the audio
+was time-compressed ~3×. Cause: the 32/48/64 CNN + a full 98-frame log-mel
+recompute took ~150 ms per poll against a 100 ms hop; the I2S DMA overflowed and
+dropped buffers, so the model never saw intact speech (host evals passed because
+they have no real-time constraint — this also explains why the 06-30 model
+"worked on paper" but not on the device). Fixes, all firmware-side, NO retrain:
+
+- `ww_infer.h` exposes `ww_logmel_frame()` + `ww_infer_from_feat()`;
+  `wake_word.h` keeps a rolling feature buffer and computes ONLY the
+  `WW_HOP/WW_FRAME_STEP` new rows per poll (bit-exact vs full recompute).
+- The per-window peak-normalisation stage was REMOVED (CMN already makes the
+  model level-invariant); the noise gate now uses a ring of per-hop peaks.
+- `WW_HOP` 1600→3200 (200 ms budget), `WW_CONSEC` 3→2 (still 400 ms sustained),
+  I2S `dma_buf_count` 8→12 (384 ms of slack for heartbeat/display stalls).
+- Test mode prints `dt` (ms/poll). dt must sit at ~hop; higher = dropping audio.
+- `eval_device.py` now mirrors this exactly (no gain stage, codec boost +
+  clipping applied to the recordings, 200 ms hop). Result @thr 0.90/consec 2:
+  recall 149/149 (min debounced score 0.971), ambient 0 fires/10 min,
+  other-speech 6/200.
